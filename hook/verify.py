@@ -1,7 +1,6 @@
 """支付回调 webhook 签名校验的核心实现。
 
-所有函数当前都是桩：调用即 raise NotImplementedError。
-实现时必须遵守各函数 docstring 中的契约，尤其是：
+实现严格遵守各函数 docstring 中的契约，尤其是：
 
 * 规范化串使用 v1 格式，字段排序，空值省略，请求体参与签名；
 * 签名比较使用 hmac.compare_digest；
@@ -13,9 +12,31 @@
 import hashlib
 import hmac
 import json
+import re
 from urllib.parse import quote
 
 _NONCE_TTL_SECONDS = 600
+_INTEGER_RE = re.compile(r"^-?\d+$")
+
+
+def _as_bytes(value):
+    """str 按 UTF-8 编码，bytes 原样返回。"""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    raise TypeError("expected str or bytes")
+
+
+def _to_epoch_seconds(value):
+    """接受 int 或纯十进制整数字符串，返回 int；bool 与其他类型一律非法。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and _INTEGER_RE.match(value):
+        return int(value)
+    return None
 
 
 def canonical_request(body, headers, timestamp) -> str:
@@ -43,7 +64,30 @@ def canonical_request(body, headers, timestamp) -> str:
     相同字段集合无论字典插入顺序如何，结果必须相同；body 任一字节变化，
     结果必须变化。
     """
-    raise NotImplementedError
+    body_bytes = _as_bytes(body)
+    body_digest = hashlib.sha256(body_bytes).hexdigest()
+
+    lines = ["v1", str(timestamp), body_digest]
+
+    # 收集后统一按 (头名, 编码值) 排序，消除字典插入顺序对签名的影响。
+    header_rows = []
+    for name, value in headers.items():
+        lower_name = str(name).lower().strip()
+        if not lower_name.startswith("x-"):
+            continue
+        if lower_name in ("x-signature", "x-timestamp"):
+            continue
+        if value is None:
+            continue
+        trimmed = str(value).strip()
+        if trimmed == "":
+            continue
+        encoded = quote(trimmed, safe="")
+        header_rows.append((lower_name, encoded))
+
+    header_rows.sort(key=lambda item: (item[0], item[1]))
+    lines.extend(f"{name}:{value}" for name, value in header_rows)
+    return "\n".join(lines)
 
 
 def sign(secret, payload) -> str:
@@ -52,7 +96,7 @@ def sign(secret, payload) -> str:
     secret 与 payload 为 str 时按 UTF-8 编码，为 bytes 时原样使用。
     输出固定为 64 个十六进制字符。
     """
-    raise NotImplementedError
+    return hmac.new(_as_bytes(secret), _as_bytes(payload), hashlib.sha256).hexdigest()
 
 
 def verify_signature(secret, payload, provided) -> bool:
@@ -62,7 +106,21 @@ def verify_signature(secret, payload, provided) -> bool:
     provided 必须是 str；None、非 str、长度不是 64 或非十六进制时返回 False，
     不得抛出异常。只接受 sign 输出的小写十六进制形式。
     """
-    raise NotImplementedError
+    if not isinstance(provided, str):
+        return False
+    if len(provided) != 64:
+        return False
+    try:
+        int(provided, 16)
+    except ValueError:
+        return False
+    if provided != provided.lower():
+        return False
+
+    expected = sign(secret, payload)
+    # 通过模块属性访问，保证测试对 hmac.compare_digest 的 monkeypatch 生效，
+    # 同时比较本身是恒定时间的，不泄漏签名前缀。
+    return hmac.compare_digest(expected, provided)
 
 
 def timestamp_ok(timestamp, now, window) -> bool:
@@ -73,7 +131,14 @@ def timestamp_ok(timestamp, now, window) -> bool:
     timestamp 与 now 为 epoch 秒，接受 int 或纯十进制整数字符串；
     window 必须为正整数秒。任一参数非法时返回 False。
     """
-    raise NotImplementedError
+    ts = _to_epoch_seconds(timestamp)
+    current = _to_epoch_seconds(now)
+    if ts is None or current is None:
+        return False
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        return False
+    # 闭区间 [now - window, now]：未来时间戳与超出窗口的历史时间戳都拒绝。
+    return current - window <= ts <= current
 
 
 def nonce_seen(store, nonce, now) -> bool:
@@ -85,7 +150,54 @@ def nonce_seen(store, nonce, now) -> bool:
     store[nonce] = now + 600 并返回 False。空 nonce 视为已见并返回 True。
     TTL 固定为 600 秒。
     """
-    raise NotImplementedError
+    # 先清理过期项，保证台账不会随运行时间无界增长。
+    expired = [key for key, deadline in store.items() if deadline <= now]
+    for key in expired:
+        del store[key]
+
+    if nonce is None or (isinstance(nonce, str) and nonce.strip() == ""):
+        return True
+
+    # 先查询后登记：同一个 nonce 第二次出现即判重放。
+    if nonce in store:
+        return True
+
+    store[nonce] = now + _NONCE_TTL_SECONDS
+    return False
+
+
+def validate_policy(policy) -> list[str]:
+    """返回策略问题代码列表，空列表表示策略可用。
+
+    检查项（按此顺序返回）:
+        * window 缺失或不是正整数: window_missing / window_invalid；
+        * replay 不为 True: replay_disabled；
+        * algorithm 不是 sha256: algorithm_weak（md5、sha1 等均视为过弱）。
+    """
+    problems = []
+
+    window = policy.get("window")
+    if "window" not in policy or window is None:
+        problems.append("window_missing")
+    elif isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        problems.append("window_invalid")
+
+    if policy.get("replay") is not True:
+        problems.append("replay_disabled")
+
+    if policy.get("algorithm") != "sha256":
+        problems.append("algorithm_weak")
+
+    return problems
+
+
+def _header(headers, name):
+    """大小写不敏感地取请求头，缺失返回 None。"""
+    target = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == target:
+            return value
+    return None
 
 
 def verify_request(request, secret, policy, now) -> dict:
@@ -120,22 +232,73 @@ def verify_request(request, secret, policy, now) -> dict:
         5. 策略、时间窗、签名、body 全部通过后才查询并登记 nonce，
            避免未认证请求消耗 nonce。
     reasons 使用以下代码: window_missing、window_invalid、replay_disabled、
-    algorithm_weak、timestamp_out_of_window、signature_mismatch、
-    body_invalid_json、nonce_missing、replay_duplicate。
+        algorithm_weak、timestamp_out_of_window、signature_mismatch、
+        body_invalid_json、nonce_missing、replay_duplicate。
     未执行到的检查记为 None。
     """
-    raise NotImplementedError
+    checks = {
+        "policy": None,
+        "timestamp": None,
+        "signature": None,
+        "body": None,
+        "replay": None,
+    }
+    reasons = []
+    headers = request.get("headers", {})
+    body = request.get("body")
 
+    # 1. 策略校验：窗口必须来自配置且为正整数，重放必须开启，算法必须够强。
+    policy_problems = validate_policy(policy)
+    checks["policy"] = not policy_problems
+    if policy_problems:
+        reasons.extend(policy_problems)
+        return {"ok": False, "checks": checks, "reasons": reasons}
 
-def validate_policy(policy) -> list[str]:
-    """返回策略问题代码列表，空列表表示策略可用。
+    # 2. 时间窗校验：窗口取配置值，未来时间戳与过期时间戳一律拒绝。
+    raw_timestamp = _header(headers, "X-Timestamp")
+    timestamp = _to_epoch_seconds(raw_timestamp)
+    if timestamp is None or not timestamp_ok(timestamp, now, policy["window"]):
+        checks["timestamp"] = False
+        reasons.append("timestamp_out_of_window")
+        return {"ok": False, "checks": checks, "reasons": reasons}
+    checks["timestamp"] = True
 
-    检查项（按此顺序返回）:
-        * window 缺失或不是正整数: window_missing / window_invalid；
-        * replay 不为 True: replay_disabled；
-        * algorithm 不是 sha256: algorithm_weak（md5、sha1 等均视为过弱）。
-    """
-    raise NotImplementedError
+    # 3. 用原始 body 字节构造规范化串并验签：body 参与签名，恒定时间比较。
+    canonical = canonical_request(body, headers, raw_timestamp)
+    provided_signature = _header(headers, "X-Signature")
+    if not verify_signature(secret, canonical, provided_signature):
+        checks["signature"] = False
+        reasons.append("signature_mismatch")
+        return {"ok": False, "checks": checks, "reasons": reasons}
+    checks["signature"] = True
+
+    # 4. 验签通过之后才解析 JSON，避免未认证请求在解析阶段触发危险逻辑。
+    try:
+        body_bytes = _as_bytes(body)
+        json.loads(body_bytes.decode("utf-8"))
+    except (ValueError, UnicodeError, TypeError):
+        checks["body"] = False
+        reasons.append("body_invalid_json")
+        return {"ok": False, "checks": checks, "reasons": reasons}
+    checks["body"] = True
+
+    # 5. 前面全部通过后才触碰 nonce 台账：先查后登记，过期项同步清理。
+    nonce = _header(headers, "X-Nonce")
+    if nonce is None or (isinstance(nonce, str) and nonce.strip() == ""):
+        checks["replay"] = False
+        reasons.append("nonce_missing")
+        return {"ok": False, "checks": checks, "reasons": reasons}
+
+    store = policy.get("nonce_store")
+    if not isinstance(store, dict):
+        store = {}
+    if nonce_seen(store, nonce, now):
+        checks["replay"] = False
+        reasons.append("replay_duplicate")
+        return {"ok": False, "checks": checks, "reasons": reasons}
+
+    checks["replay"] = True
+    return {"ok": True, "checks": checks, "reasons": reasons}
 
 
 def hook_batch(requests, secret, policy, now) -> dict:
@@ -146,4 +309,5 @@ def hook_batch(requests, secret, policy, now) -> dict:
     共享 policy 中的 nonce_store，同一批次内重复的 nonce 仍判为重放。
     返回 {"ok": 所有请求均 ok, "results": [verify_request 结果, ...]}。
     """
-    raise NotImplementedError
+    results = [verify_request(request, secret, policy, now) for request in requests]
+    return {"ok": all(result["ok"] for result in results), "results": results}
